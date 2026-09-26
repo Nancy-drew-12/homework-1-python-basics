@@ -1,4 +1,4 @@
-import math
+nano src/bank_account.py
 import uuid
 
 from src.abstract_account import AbstractAccount
@@ -18,26 +18,12 @@ def generate_short_uuid() -> str:
     return str(uuid.uuid4())[:8]
 
 
-def _is_valid_amount(amount) -> bool:
-    """Проверяет, что сумма — конечное положительное число (не bool, не nan, не inf)"""
-    if isinstance(amount, bool):
-        return False
-    if not isinstance(amount, (int, float)):
-        return False
-    if not math.isfinite(amount):
-        return False
-    return amount > 0
-
-
 class BankAccount(AbstractAccount):
     """Конкретная реализация банковского счёта"""
 
     def __init__(self, owner: str, currency: str = "RUB", account_id: str = None):
-        # автогенерация ТОЛЬКО если account_id вообще не передали
-        if account_id is None:
+        if not account_id:
             account_id = generate_short_uuid()
-        elif not isinstance(account_id, str) or not account_id:
-            raise InvalidOperationError("Номер счёта должен быть непустой строкой")
 
         if currency not in VALID_CURRENCIES:
             raise InvalidOperationError(
@@ -61,10 +47,8 @@ class BankAccount(AbstractAccount):
     def deposit(self, amount: float):
         self._check_active()
 
-        if not _is_valid_amount(amount):
-            raise InvalidOperationError(
-                "Сумма пополнения должна быть конечным положительным числом"
-            )
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            raise InvalidOperationError("Сумма пополнения должна быть положительным числом")
 
         self._balance += amount
         return self._balance
@@ -72,10 +56,8 @@ class BankAccount(AbstractAccount):
     def withdraw(self, amount: float):
         self._check_active()
 
-        if not _is_valid_amount(amount):
-            raise InvalidOperationError(
-                "Сумма снятия должна быть конечным положительным числом"
-            )
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            raise InvalidOperationError("Сумма снятия должна быть положительным числом")
 
         if amount > self._balance:
             raise InsufficientFundsError(
