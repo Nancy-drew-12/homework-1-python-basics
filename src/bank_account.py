@@ -18,8 +18,8 @@ def generate_short_uuid() -> str:
     return str(uuid.uuid4())[:8]
 
 
-def _is_valid_amount(amount) -> bool:
-    """Проверяет, что сумма — конечное положительное число (не bool, не nan, не inf)"""
+def is_valid_amount(amount) -> bool:
+    """Проверяет, что сумма - конечное положительное число (не bool, не nan, не inf)"""
     if isinstance(amount, bool):
         return False
     if not isinstance(amount, (int, float)):
@@ -27,6 +27,13 @@ def _is_valid_amount(amount) -> bool:
     if not math.isfinite(amount):
         return False
     return amount > 0
+
+
+def is_valid_non_negative(value) -> bool:
+    """Конечное число >= 0 (не bool, не nan, не inf) - для параметров счетов"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
 
 
 class BankAccount(AbstractAccount):
@@ -61,7 +68,7 @@ class BankAccount(AbstractAccount):
     def deposit(self, amount: float):
         self._check_active()
 
-        if not _is_valid_amount(amount):
+        if not is_valid_amount(amount):
             raise InvalidOperationError(
                 "Сумма пополнения должна быть конечным положительным числом"
             )
@@ -72,7 +79,7 @@ class BankAccount(AbstractAccount):
     def withdraw(self, amount: float):
         self._check_active()
 
-        if not _is_valid_amount(amount):
+        if not is_valid_amount(amount):
             raise InvalidOperationError(
                 "Сумма снятия должна быть конечным положительным числом"
             )

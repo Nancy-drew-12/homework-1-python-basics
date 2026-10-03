@@ -115,8 +115,53 @@ def test_polymorphism():
         print()
 
 
+def test_mentor_fixes():
+    print("=== Проверка правок по ревью ===\n")
+
+    # nan и bool в параметрах счетов
+    for kwargs in [{"min_balance": float("nan")}, {"monthly_rate": True}]:
+        try:
+            SavingsAccount(owner="Тест", **kwargs)
+            print(f"ОШИБКА: принято {kwargs}")
+        except InvalidOperationError as e:
+            print(f"Корректно отклонено {kwargs}: {e}")
+
+    try:
+        PremiumAccount(owner="Тест", overdraft_limit=float("nan"))
+        print("ОШИБКА: принят overdraft_limit=nan")
+    except InvalidOperationError as e:
+        print(f"Корректно отклонено overdraft_limit=nan: {e}")
+
+    # nan и True в операциях наследников
+    inv = InvestmentAccount(owner="Тест")
+    inv.deposit(1000)
+    for bad in [float("nan"), True]:
+        try:
+            inv.invest("stocks", bad)
+            print(f"ОШИБКА: invest принял {bad}")
+        except InvalidOperationError as e:
+            print(f"Корректно отклонено invest({bad}): {e}")
+
+    # проценты на замороженном счёте
+    sav = SavingsAccount(owner="Тест", min_balance=0)
+    sav.deposit(1000)
+    sav.freeze()
+    try:
+        sav.apply_monthly_interest()
+        print("ОШИБКА: проценты начислены на замороженный счёт")
+    except Exception as e:
+        print(f"Корректно отклонено: {e}")
+
+    # комиссия Premium реально списывается
+    prem = PremiumAccount(owner="Тест", overdraft_limit=1000, fixed_fee=100)
+    prem.deposit(1000)
+    prem.withdraw(500)
+    print(f"Premium: 1000 - 500 - комиссия 100 = {prem.get_account_info()['balance']} (ожидаем 400.0)")
+
+
 if __name__ == "__main__":
     test_savings_account()
     test_premium_account()
     test_investment_account()
     test_polymorphism()
+    test_mentor_fixes()

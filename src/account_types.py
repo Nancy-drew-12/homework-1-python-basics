@@ -1,4 +1,6 @@
-from src.bank_account import BankAccount
+import math
+
+from src.bank_account import BankAccount, is_valid_amount, is_valid_non_negative
 from src.exceptions import InvalidOperationError, InsufficientFundsError
 
 
@@ -9,10 +11,10 @@ class SavingsAccount(BankAccount):
                  min_balance: float = 1000.0, monthly_rate: float = 0.01):
         super().__init__(owner=owner, currency=currency, account_id=account_id)
 
-        if not isinstance(min_balance, (int, float)) or min_balance < 0:
-            raise InvalidOperationError("Минимальный остаток должен быть неотрицательным числом")
-        if not isinstance(monthly_rate, (int, float)) or monthly_rate < 0:
-            raise InvalidOperationError("Месячная ставка должна быть неотрицательным числом")
+        if not is_valid_non_negative(min_balance):
+            raise InvalidOperationError("Минимальный остаток должен быть конечным неотрицательным числом")
+        if not is_valid_non_negative(monthly_rate):
+            raise InvalidOperationError("Месячная ставка должна быть конечным неотрицательным числом")
 
         self._min_balance = min_balance
         self._monthly_rate = monthly_rate
@@ -20,10 +22,9 @@ class SavingsAccount(BankAccount):
     def withdraw(self, amount: float):
         self._check_active()
 
-        if not isinstance(amount, (int, float)) or amount <= 0:
-            raise InvalidOperationError("Сумма снятия должна быть положительным числом")
+        if not is_valid_amount(amount):
+            raise InvalidOperationError("Сумма снятия должна быть конечным положительным числом")
 
-        # нельзя уйти ниже минимального остатка
         if self._balance - amount < self._min_balance:
             raise InsufficientFundsError(
                 f"Нельзя снять {amount}: баланс не может быть ниже "
@@ -34,7 +35,8 @@ class SavingsAccount(BankAccount):
         return self._balance
 
     def apply_monthly_interest(self):
-        """Начисляет процент на текущий баланс"""
+        """Начисляет процент на текущий баланс (только на активном счёте)"""
+        self._check_active()
         interest = self._balance * self._monthly_rate
         self._balance += interest
         return interest
@@ -56,33 +58,35 @@ class SavingsAccount(BankAccount):
 
 
 class PremiumAccount(BankAccount):
-    """Премиум-счёт с овердрафтом и увеличенными лимитами"""
+    """Премиум-счёт с овердрафтом и фиксированной комиссией за снятие"""
 
     def __init__(self, owner: str, currency: str = "RUB", account_id: str = None,
                  overdraft_limit: float = 50000.0, fixed_fee: float = 500.0):
         super().__init__(owner=owner, currency=currency, account_id=account_id)
 
-        if not isinstance(overdraft_limit, (int, float)) or overdraft_limit < 0:
-            raise InvalidOperationError("Лимит овердрафта должен быть неотрицательным числом")
-        if not isinstance(fixed_fee, (int, float)) or fixed_fee < 0:
-            raise InvalidOperationError("Комиссия должна быть неотрицательным числом")
+        if not is_valid_non_negative(overdraft_limit):
+            raise InvalidOperationError("Лимит овердрафта должен быть конечным неотрицательным числом")
+        if not is_valid_non_negative(fixed_fee):
+            raise InvalidOperationError("Комиссия должна быть конечным неотрицательным числом")
 
         self._overdraft_limit = overdraft_limit
         self._fixed_fee = fixed_fee
 
     def withdraw(self, amount: float):
+        """Списывает сумму + фиксированную комиссию; баланс может уйти в минус до лимита овердрафта"""
         self._check_active()
 
-        if not isinstance(amount, (int, float)) or amount <= 0:
-            raise InvalidOperationError("Сумма снятия должна быть положительным числом")
+        if not is_valid_amount(amount):
+            raise InvalidOperationError("Сумма снятия должна быть конечным положительным числом")
 
-        # можно уйти в минус, но не глубже лимита овердрафта
-        if self._balance - amount < -self._overdraft_limit:
+        total = amount + self._fixed_fee
+        if self._balance - total < -self._overdraft_limit:
             raise InsufficientFundsError(
-                f"Превышен лимит овердрафта {self._overdraft_limit}"
+                f"Превышен лимит овердрафта {self._overdraft_limit} "
+                f"(сумма {amount} + комиссия {self._fixed_fee})"
             )
 
-        self._balance -= amount
+        self._balance -= total
         return self._balance
 
     def get_account_info(self) -> dict:
@@ -114,8 +118,8 @@ class InvestmentAccount(BankAccount):
         """Снятие свободных денег со счёта (не из портфеля)"""
         self._check_active()
 
-        if not isinstance(amount, (int, float)) or amount <= 0:
-            raise InvalidOperationError("Сумма снятия должна быть положительным числом")
+        if not is_valid_amount(amount):
+            raise InvalidOperationError("Сумма снятия должна быть конечным положительным числом")
 
         if amount > self._balance:
             raise InsufficientFundsError(
@@ -132,11 +136,11 @@ class InvestmentAccount(BankAccount):
         if asset_type not in self.VALID_ASSET_TYPES:
             raise InvalidOperationError(
                 f"Недопустимый тип актива: {asset_type}. "
-                f"Допустимые: {', '.join(self.VALID_ASSET_TYPES)}"
+                f"Допустимые: {', '.join(sorted(self.VALID_ASSET_TYPES))}"
             )
 
-        if not isinstance(amount, (int, float)) or amount <= 0:
-            raise InvalidOperationError("Сумма инвестиции должна быть положительным числом")
+        if not is_valid_amount(amount):
+            raise InvalidOperationError("Сумма инвестиции должна быть конечным положительным числом")
 
         if amount > self._balance:
             raise InsufficientFundsError(
@@ -148,17 +152,19 @@ class InvestmentAccount(BankAccount):
         return self._portfolio[asset_type]
 
     def project_yearly_growth(self, growth_rates: dict) -> float:
-        """
-        Рассчитывает ожидаемый годовой прирост портфеля.
-        growth_rates: словарь {тип_актива: годовая_ставка}, например {"stocks": 0.10, "bonds": 0.04, "etf": 0.07}
-        """
+        """Ожидаемый годовой прирост портфеля. growth_rates: {тип_актива: годовая_ставка}"""
         if not isinstance(growth_rates, dict):
             raise InvalidOperationError("growth_rates должен быть словарём")
 
+        for asset_type, rate in growth_rates.items():
+            if asset_type not in self.VALID_ASSET_TYPES:
+                raise InvalidOperationError(f"Недопустимый тип актива в ставках: {asset_type}")
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate):
+                raise InvalidOperationError(f"Некорректная ставка для {asset_type}: {rate}")
+
         total_growth = 0.0
         for asset_type, amount in self._portfolio.items():
-            rate = growth_rates.get(asset_type, 0.0)
-            total_growth += amount * rate
+            total_growth += amount * growth_rates.get(asset_type, 0.0)
 
         return total_growth
 
@@ -170,7 +176,7 @@ class InvestmentAccount(BankAccount):
 
     def __str__(self):
         last_four = self._account_id[-4:]
-        portfolio_str = ", ".join(f"{k}={v}" for k, v in self._portfolio.items())
+        portfolio_str = ", ".join(f"{k}={v}" for k, v in sorted(self._portfolio.items()))
         return (
             f"InvestmentAccount(владелец={self._owner}, №***{last_four}, "
             f"статус={self._status}, свободный баланс={self._balance} {self._currency}, "
