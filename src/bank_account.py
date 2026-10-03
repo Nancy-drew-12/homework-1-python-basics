@@ -99,14 +99,29 @@ class BankAccount(AbstractAccount):
             "balance": self._balance,
             "currency": self._currency,
             "status": self._status,
+            "type": "bank",
         }
 
     def freeze(self):
         """Заморозить счёт"""
+        if self._status == "closed":
+            raise AccountClosedError(f"Счёт {self._account_id} закрыт")
+        if self._status == "frozen":
+            raise InvalidOperationError("Счёт уже заморожен")
         self._status = "frozen"
 
+    def unfreeze(self):
+        """Разморозить счёт"""
+        if self._status == "closed":
+            raise AccountClosedError(f"Счёт {self._account_id} закрыт")
+        if self._status != "frozen":
+            raise InvalidOperationError("Счёт не заморожен")
+        self._status = "active"
+    
     def close(self):
         """Закрыть счёт"""
+        if self._status == "closed":
+            raise AccountClosedError(f"Счёт {self._account_id} уже закрыт")
         self._status = "closed"
 
     def __str__(self):

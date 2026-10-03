@@ -30,7 +30,7 @@
 
 - [x] День 1 - базовая модель банковских счетов (AbstractAccount, BankAccount, кастомные исключения)
 - [x] День 2 - SavingsAccount, PremiumAccount, InvestmentAccount
-- [ ] День 3
+- [x] День 3
 - [ ] День 4
 - [ ] День 5
 - [ ] День 6
