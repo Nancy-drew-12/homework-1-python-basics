@@ -46,4 +46,8 @@ class UnderageClientError(Exception):
     """Клиенту меньше 18 лет"""
     pass
 
+class TransactionRuleError(Exception):
+    """Нарушено правило обработки транзакции"""
+    pass
+
 

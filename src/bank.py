@@ -74,6 +74,20 @@ class Bank:
         """Любая операция со счётом сначала проходит проверку времени"""
         self._check_operating_hours(self._account_owner.get(account_id), action)
         return self._get_account(account_id)
+    
+    def now(self):
+        """Текущее время банка (с учётом подменённых часов в тестах)"""
+        return self._clock()
+
+    def is_night_now(self) -> bool:
+        return self.NIGHT_START_HOUR <= self._clock().hour < self.NIGHT_END_HOUR
+
+    def next_operating_time(self):
+        """Ближайший момент, когда операции разрешены"""
+        now = self._clock()
+        if self.is_night_now():
+            return now.replace(hour=self.NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
+        return now
 
     # ---------- клиенты ----------
 
