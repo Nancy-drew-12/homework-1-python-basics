@@ -92,6 +92,10 @@ class BankAccount(AbstractAccount):
         self._balance -= amount
         return self._balance
 
+    def total_value(self) -> float:
+        """Полная стоимость счёта. У обычного счёта это баланс"""
+        return self._balance
+
     def get_account_info(self) -> dict:
         return {
             "account_id": self._account_id,
@@ -100,6 +104,7 @@ class BankAccount(AbstractAccount):
             "currency": self._currency,
             "status": self._status,
             "type": "bank",
+            "total_value": self.total_value(),
         }
 
     def freeze(self):

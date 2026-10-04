@@ -168,6 +168,10 @@ class InvestmentAccount(BankAccount):
 
         return total_growth
 
+    def total_value(self) -> float:
+        """Свободный баланс плюс всё, что вложено в портфель"""
+        return self._balance + sum(self._portfolio.values())
+
     def get_account_info(self) -> dict:
         info = super().get_account_info()
         info["type"] = "investment"

@@ -43,17 +43,20 @@ def main():
         print(f"Несовершеннолетний отклонён: {e}")
     print()
 
-    print("=== 2. Открытие счетов ===")
+    print("=== 2. Открытие счетов (банк возвращает только номера) ===")
     acc_bank = bank.open_account("c-anna", "bank", "RUB")
     acc_save = bank.open_account("c-anna", "savings", "RUB", min_balance=1000)
     acc_prem = bank.open_account("c-boris", "premium", "USD", overdraft_limit=5000, fixed_fee=10)
     acc_inv = bank.open_account("c-boris", "investment", "RUB")
-    acc_bank.deposit(20000)
-    acc_save.deposit(50000)
-    acc_prem.deposit(300)
-    acc_inv.deposit(10000)
-    for acc in (acc_bank, acc_save, acc_prem, acc_inv):
-        print(acc)
+    print("Тип возвращаемого значения open_account:", type(acc_bank).__name__)
+
+    bank.deposit(acc_bank, 20000)
+    bank.deposit(acc_save, 50000)
+    bank.deposit(acc_prem, 300)
+    bank.deposit(acc_inv, 10000)
+    bank.invest(acc_inv, "stocks", 10000)  # весь баланс уходит в портфель
+    for account_id in (acc_bank, acc_save, acc_prem, acc_inv):
+        print(bank.describe_account(account_id))
     print()
 
     print("=== 3. Вход и блокировка после 3 неверных попыток ===")
@@ -76,47 +79,72 @@ def main():
     print()
 
     print("=== 4. Заморозка и разморозка ===")
-    bank.freeze_account(acc_bank.get_account_info()["account_id"])
-    print(acc_bank)
+    bank.freeze_account(acc_bank)
+    print(bank.describe_account(acc_bank))
     try:
-        acc_bank.deposit(100)
+        bank.deposit(acc_bank, 100)
     except AccountFrozenError as e:
         print(f"Операция по замороженному счёту: {e}")
-    bank.unfreeze_account(acc_bank.get_account_info()["account_id"])
-    acc_bank.deposit(100)
-    print(acc_bank)
+    bank.unfreeze_account(acc_bank)
+    bank.deposit(acc_bank, 100)
+    print(bank.describe_account(acc_bank))
     print()
 
     print("=== 5. Закрытие счёта ===")
     try:
-        bank.close_account(acc_bank.get_account_info()["account_id"])
+        bank.close_account(acc_bank)
     except InvalidOperationError as e:
         print(f"Закрытие счёта с остатком: {e}")
+
+    inv_info = bank.get_account_info(acc_inv)
+    print(f"Инвестсчёт: свободный баланс {inv_info['balance']}, полная стоимость {inv_info['total_value']}")
+    try:
+        bank.close_account(acc_inv)
+    except InvalidOperationError as e:
+        print(f"Закрытие инвестсчёта с активами в портфеле: {e}")
+
     empty = bank.open_account("c-anna", "bank", "EUR")
-    bank.close_account(empty.get_account_info()["account_id"])
-    print(empty)
+    bank.close_account(empty)
+    print(bank.describe_account(empty))
     print()
 
-    print("=== 6. Ночной запрет (03:30) ===")
+    print("=== 6. Ночной запрет (03:30): все пути через банк ===")
     clock.now = datetime(2026, 10, 4, 3, 30)
-    try:
-        bank.open_account("c-anna", "bank")
-    except NightOperationError as e:
-        print(f"Ночью: {e}")
+    balance_before = bank.get_account_info(acc_bank)["balance"]
+    attempts = [
+        ("open_account", lambda: bank.open_account("c-anna", "bank")),
+        ("deposit", lambda: bank.deposit(acc_bank, 100)),
+        ("withdraw", lambda: bank.withdraw(acc_bank, 100)),
+        ("invest", lambda: bank.invest(acc_inv, "bonds", 1)),
+        ("apply_monthly_interest", lambda: bank.apply_monthly_interest(acc_save)),
+    ]
+    for name, action in attempts:
+        try:
+            action()
+            print(f"ОШИБКА: {name} прошла ночью!")
+        except NightOperationError as e:
+            print(f"{name}: {e}")
+    balance_after = bank.get_account_info(acc_bank)["balance"]
+    print(f"Баланс не изменился: {balance_before} -> {balance_after}")
+
     clock.now = datetime(2026, 10, 4, 5, 0)
-    bank.open_account("c-anna", "bank")
+    bank.withdraw(acc_bank, 100)
     print("В 05:00 операции уже разрешены")
     print()
 
-    print("=== 7. Поиск счетов ===")
+    print("=== 7. Поиск счетов (возвращает копии данных) ===")
     print("Счета Анны:", len(bank.search_accounts(client_id="c-anna")))
-    print("Сберегательные:", [a.get_account_info()["account_id"] for a in bank.search_accounts(account_type="savings")])
+    print("Сберегательные:", [a["account_id"] for a in bank.search_accounts(account_type="savings")])
     print("В USD:", len(bank.search_accounts(currency="USD")))
     print("Закрытые:", len(bank.search_accounts(status="closed")))
     print("Владелец содержит 'орлов':", len(bank.search_accounts(owner="орлов")))
+
+    copy = bank.search_accounts(account_type="savings")[0]
+    copy["balance"] = 999999
+    print("Правка копии не влияет на счёт:", bank.get_account_info(acc_save)["balance"])
     print()
 
-    print("=== 8. Баланс и рейтинг ===")
+    print("=== 8. Баланс и рейтинг (портфель учитывается) ===")
     print("Общий баланс по валютам:", bank.get_total_balance())
     print("Общий баланс RUB:", bank.get_total_balance("RUB"))
     for place, row in enumerate(bank.get_clients_ranking("RUB"), start=1):
