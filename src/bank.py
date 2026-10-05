@@ -44,15 +44,19 @@ class Bank:
             raise InvalidOperationError("Название банка должно быть непустой строкой")
         self._name = name
         self._clock = clock or datetime.now  # clock можно подменить в тестах
-        # именно "is not None": пустой AuditLog считается "ложным" из-за __len__
         self._audit = audit if audit is not None else AuditLog(clock=self._clock)
         self._risk = risk_analyzer if risk_analyzer is not None else RiskAnalyzer()
         self._clients = {}         # client_id -> Client
         self._accounts = {}        # account_id -> счёт
         self._account_owner = {}   # account_id -> client_id
         self._suspicious = []      # журнал подозрительных действий
+        self._ledger = []          # журнал движения денег по счетам (для отчётов и графиков)
 
     # ---------- свойства ----------
+
+    @property
+    def name(self) -> str:
+        return self._name
 
     @property
     def audit(self) -> AuditLog:
@@ -64,10 +68,6 @@ class Bank:
 
     def audit_reports(self) -> AuditReports:
         return AuditReports(self._audit, self._risk)
-
-    def owner_of(self, account_id: str):
-        """ID клиента-владельца счёта (или None, если счёта нет)"""
-        return self._account_owner.get(account_id)
 
     # ---------- время ----------
 
@@ -121,7 +121,50 @@ class Bank:
         self._check_operating_hours(self._account_owner.get(account_id), action)
         return self._get_account(account_id)
 
+    def owner_of(self, account_id: str):
+        """ID клиента-владельца счёта (или None, если счёта нет)"""
+        return self._account_owner.get(account_id)
+
+    # ---------- журнал движения денег ----------
+
+    def _log_change(self, account_id: str, kind: str, value_before: float):
+        """Записывает изменение полной стоимости счёта (нулевые изменения не пишем)"""
+        account = self._accounts[account_id]
+        info = account.get_account_info()
+        after = account.total_value()
+        delta = round(after - value_before, 2)
+        if delta == 0:
+            return
+        self._ledger.append({
+            "time": self._clock(),
+            "account_id": account_id,
+            "client_id": self._account_owner.get(account_id),
+            "currency": info["currency"],
+            "kind": kind,
+            "delta": delta,
+            "balance_after": round(after, 2),
+        })
+
+    def get_ledger(self, client_id: str = None, account_id: str = None) -> list:
+        """Копии записей журнала движения денег (по времени), можно фильтровать"""
+        return [dict(e) for e in self._ledger
+                if (client_id is None or e["client_id"] == client_id)
+                and (account_id is None or e["account_id"] == account_id)]
+
     # ---------- клиенты ----------
+
+    def get_client_info(self, client_id: str) -> dict:
+        """Данные клиента без пароля (копия)"""
+        client = self._get_client(client_id)
+        return {
+            "client_id": client.client_id,
+            "full_name": client.full_name,
+            "status": client.status,
+            "account_ids": list(client.account_ids),
+        }
+
+    def list_clients(self) -> list:
+        return [self.get_client_info(cid) for cid in self._clients]
 
     def add_client(self, client: Client) -> str:
         if not isinstance(client, Client):
@@ -197,9 +240,8 @@ class Bank:
         self._accounts[account_id] = account
         self._account_owner[account_id] = client_id
         client.add_account(account_id)
-        self._risk.register_known(client_id, f"acc:{account_id}")  # свои счета не считаются «новыми»
-        self._audit.log(Severity.INFO, "account_opened",
-                        f"Открыт счёт {account_id} ({account_type}, {currency})",
+        self._risk.register_known(client_id, f"acc:{account_id}")  # свои счета - не "новые"
+        self._audit.log(Severity.INFO, "account_opened", f"Открыт счёт {account_id} ({account_type}, {currency})",
                         client_id=client_id, account_id=account_id)
         return account_id
 
@@ -222,10 +264,18 @@ class Bank:
     # ---------- счета: денежные операции (только через банк) ----------
 
     def deposit(self, account_id: str, amount: float):
-        return self._account_for_operation(account_id, "deposit").deposit(amount)
+        account = self._account_for_operation(account_id, "deposit")
+        before = account.total_value()
+        result = account.deposit(amount)
+        self._log_change(account_id, "deposit", before)
+        return result
 
     def withdraw(self, account_id: str, amount: float):
-        return self._account_for_operation(account_id, "withdraw").withdraw(amount)
+        account = self._account_for_operation(account_id, "withdraw")
+        before = account.total_value()
+        result = account.withdraw(amount)
+        self._log_change(account_id, "withdraw", before)
+        return result
 
     def invest(self, account_id: str, asset_type: str, amount: float):
         account = self._account_for_operation(account_id, "invest")
@@ -237,7 +287,10 @@ class Bank:
         account = self._account_for_operation(account_id, "apply_monthly_interest")
         if not isinstance(account, SavingsAccount):
             raise InvalidOperationError("Проценты начисляются только на сберегательном счёте")
-        return account.apply_monthly_interest()
+        before = account.total_value()
+        result = account.apply_monthly_interest()
+        self._log_change(account_id, "interest", before)
+        return result
 
     # ---------- проведение транзакций (с риск-анализом и откатом) ----------
 
@@ -260,13 +313,13 @@ class Bank:
         for acc, role in ((sender, "отправителя"), (recipient, "получателя")):
             if acc is None:
                 continue
-            info = acc.get_account_info()
-            if info["status"] == "frozen":
+            status = acc.get_account_info()["status"]
+            if status == "frozen":
                 raise AccountFrozenError(
-                    f"Счёт {role} {info['account_id']} заморожен: операции запрещены")
-            if info["status"] == "closed":
+                    f"Счёт {role} {acc.get_account_info()['account_id']} заморожен: операции запрещены")
+            if status == "closed":
                 raise AccountClosedError(
-                    f"Счёт {role} {info['account_id']} закрыт: операции запрещены")
+                    f"Счёт {role} {acc.get_account_info()['account_id']} закрыт: операции запрещены")
 
         # --- риск-анализ ---
         recipient_key = None
@@ -277,20 +330,20 @@ class Bank:
         if assessment.blocked:
             self._flag_suspicious(actor, f"Заблокирована операция {kind}: {assessment.reasons()}")
             self._audit.log(Severity.CRITICAL, "risk_blocked",
-                            f"Операция {kind} на {amount} {currency} заблокирована "
-                            f"(риск {assessment.score}): {assessment.reasons()}",
+                            f"Операция {kind} на {amount} {currency} заблокирована (риск {assessment.score}): "
+                            f"{assessment.reasons()}",
                             client_id=actor, error_type="RiskBlockedError", score=assessment.score)
             raise RiskBlockedError(
-                f"Операция заблокирована: высокий риск ({assessment.score} баллов): "
-                f"{assessment.reasons()}")
+                f"Операция заблокирована: высокий риск ({assessment.score} баллов): {assessment.reasons()}")
         if assessment.level.value == "medium":
             self._audit.log(Severity.WARNING, "risk_warning",
-                            f"Операция {kind} на {amount} {currency}, средний риск "
-                            f"({assessment.score}): {assessment.reasons()}",
-                            client_id=actor, score=assessment.score)
+                            f"Операция {kind} на {amount} {currency}, средний риск ({assessment.score}): "
+                            f"{assessment.reasons()}", client_id=actor, score=assessment.score)
 
         # --- движение денег с откатом ---
         snapshot = [(a, a._balance) for a in (sender, recipient) if a is not None]
+        sender_before = sender.total_value() if sender is not None else None
+        recipient_before = recipient.total_value() if recipient is not None else None
         try:
             if sender is not None:
                 sender.withdraw(debit)
@@ -301,6 +354,10 @@ class Bank:
                 acc._balance = balance
             raise
 
+        if sender is not None:
+            self._log_change(sender_id, f"{kind}_out", sender_before)
+        if recipient is not None:
+            self._log_change(recipient_id, f"{kind}_in", recipient_before)
         if recipient_key is not None:
             self._risk.confirm(actor, recipient_key)  # после успешного перевода получатель известен
         self._audit.log(Severity.INFO, "settled", f"Проведена операция {kind}: {amount} {currency}",
