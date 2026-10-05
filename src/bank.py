@@ -1,23 +1,30 @@
 from datetime import datetime
 
 from src.account_types import SavingsAccount, PremiumAccount, InvestmentAccount
+from src.audit import AuditLog, Severity
+from src.audit_reports import AuditReports
 from src.bank_account import BankAccount, VALID_CURRENCIES
 from src.client import Client
+from src.currency import convert
 from src.exceptions import (
+    AccountClosedError,
+    AccountFrozenError,
     AccountNotFoundError,
     AuthenticationError,
     ClientBlockedError,
     ClientNotFoundError,
     InvalidOperationError,
     NightOperationError,
+    RiskBlockedError,
 )
+from src.risk import RiskAnalyzer
 
 
 class Bank:
-    """Управляющий класс банка: клиенты, счета, безопасность.
+    """Управляющий класс банка: клиенты, счета, безопасность, аудит и риск-анализ.
 
     Объекты счетов наружу не выдаются: все операции идут через методы банка,
-    поэтому проверка времени и журнал подозрительных действий не обходятся.
+    поэтому проверка времени, аудит и риск-анализ не обходятся.
     """
 
     MAX_FAILED_ATTEMPTS = 3
@@ -31,15 +38,52 @@ class Bank:
         "investment": InvestmentAccount,
     }
 
-    def __init__(self, name: str, clock=None):
+    def __init__(self, name: str, clock=None, audit: AuditLog = None,
+                 risk_analyzer: RiskAnalyzer = None):
         if not isinstance(name, str) or not name.strip():
             raise InvalidOperationError("Название банка должно быть непустой строкой")
         self._name = name
         self._clock = clock or datetime.now  # clock можно подменить в тестах
+        # именно "is not None": пустой AuditLog считается "ложным" из-за __len__
+        self._audit = audit if audit is not None else AuditLog(clock=self._clock)
+        self._risk = risk_analyzer if risk_analyzer is not None else RiskAnalyzer()
         self._clients = {}         # client_id -> Client
         self._accounts = {}        # account_id -> счёт
         self._account_owner = {}   # account_id -> client_id
         self._suspicious = []      # журнал подозрительных действий
+
+    # ---------- свойства ----------
+
+    @property
+    def audit(self) -> AuditLog:
+        return self._audit
+
+    @property
+    def risk_analyzer(self) -> RiskAnalyzer:
+        return self._risk
+
+    def audit_reports(self) -> AuditReports:
+        return AuditReports(self._audit, self._risk)
+
+    def owner_of(self, account_id: str):
+        """ID клиента-владельца счёта (или None, если счёта нет)"""
+        return self._account_owner.get(account_id)
+
+    # ---------- время ----------
+
+    def now(self):
+        """Текущее время банка (с учётом подменённых часов в тестах)"""
+        return self._clock()
+
+    def is_night_now(self) -> bool:
+        return self.NIGHT_START_HOUR <= self._clock().hour < self.NIGHT_END_HOUR
+
+    def next_operating_time(self):
+        """Ближайший момент, когда операции разрешены"""
+        now = self._clock()
+        if self.is_night_now():
+            return now.replace(hour=self.NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
+        return now
 
     # ---------- служебные методы ----------
 
@@ -49,10 +93,12 @@ class Bank:
             "client_id": client_id,
             "reason": reason,
         })
+        self._audit.log(Severity.WARNING, "suspicious", reason, client_id=client_id)
 
     def _check_operating_hours(self, client_id, action: str):
-        now = self._clock()
-        if self.NIGHT_START_HOUR <= now.hour < self.NIGHT_END_HOUR:
+        if self.is_night_now():
+            now = self._clock()
+            self._risk.record_night_attempt(client_id, now, action)
             self._flag_suspicious(client_id, f"Попытка '{action}' в ночное время ({now:%H:%M})")
             raise NightOperationError(
                 f"Операции запрещены с {self.NIGHT_START_HOUR:02d}:00 до {self.NIGHT_END_HOUR:02d}:00"
@@ -74,20 +120,6 @@ class Bank:
         """Любая операция со счётом сначала проходит проверку времени"""
         self._check_operating_hours(self._account_owner.get(account_id), action)
         return self._get_account(account_id)
-    
-    def now(self):
-        """Текущее время банка (с учётом подменённых часов в тестах)"""
-        return self._clock()
-
-    def is_night_now(self) -> bool:
-        return self.NIGHT_START_HOUR <= self._clock().hour < self.NIGHT_END_HOUR
-
-    def next_operating_time(self):
-        """Ближайший момент, когда операции разрешены"""
-        now = self._clock()
-        if self.is_night_now():
-            return now.replace(hour=self.NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
-        return now
 
     # ---------- клиенты ----------
 
@@ -98,11 +130,14 @@ class Bank:
         if client.client_id in self._clients:
             raise InvalidOperationError(f"Клиент {client.client_id} уже существует")
         self._clients[client.client_id] = client
+        self._audit.log(Severity.INFO, "client_added", f"Добавлен клиент {client.full_name}",
+                        client_id=client.client_id)
         return client.client_id
 
     def unblock_client(self, client_id: str):
         self._check_operating_hours(client_id, "unblock_client")
         self._get_client(client_id).unblock()
+        self._audit.log(Severity.INFO, "client_unblocked", "Клиент разблокирован", client_id=client_id)
 
     def authenticate_client(self, client_id: str, password: str) -> bool:
         self._check_operating_hours(client_id, "authenticate_client")
@@ -127,6 +162,8 @@ class Bank:
         if attempts >= self.MAX_FAILED_ATTEMPTS:
             client.block()
             self._flag_suspicious(client_id, "Клиент заблокирован после неверных попыток входа")
+            self._audit.log(Severity.ERROR, "client_blocked", "Клиент заблокирован",
+                            client_id=client_id, error_type="ClientBlockedError")
             raise ClientBlockedError(
                 f"Клиент {client_id} заблокирован: {self.MAX_FAILED_ATTEMPTS} неверные попытки входа"
             )
@@ -160,6 +197,10 @@ class Bank:
         self._accounts[account_id] = account
         self._account_owner[account_id] = client_id
         client.add_account(account_id)
+        self._risk.register_known(client_id, f"acc:{account_id}")  # свои счета не считаются «новыми»
+        self._audit.log(Severity.INFO, "account_opened",
+                        f"Открыт счёт {account_id} ({account_type}, {currency})",
+                        client_id=client_id, account_id=account_id)
         return account_id
 
     def close_account(self, account_id: str):
@@ -197,6 +238,74 @@ class Bank:
         if not isinstance(account, SavingsAccount):
             raise InvalidOperationError("Проценты начисляются только на сберегательном счёте")
         return account.apply_monthly_interest()
+
+    # ---------- проведение транзакций (с риск-анализом и откатом) ----------
+
+    def settle(self, kind: str, amount: float, currency: str, sender_id: str = None,
+               debit: float = None, recipient_id: str = None, credit: float = None,
+               external_recipient: str = None, fee: float = 0.0):
+        """Проводит одну операцию целиком.
+
+        amount/currency - сумма в валюте транзакции (для оценки риска),
+        debit - сколько списать со счёта отправителя (в его валюте, с комиссией),
+        credit - сколько зачислить получателю (в его валюте).
+        Порядок: ночь -> счета и статусы -> риск (high блокируется) -> движение денег
+        с откатом при ошибке -> аудит.
+        """
+        actor = self._account_owner.get(sender_id) or self._account_owner.get(recipient_id)
+        self._check_operating_hours(actor, kind)
+
+        sender = self._get_account(sender_id) if sender_id else None
+        recipient = self._get_account(recipient_id) if recipient_id else None
+        for acc, role in ((sender, "отправителя"), (recipient, "получателя")):
+            if acc is None:
+                continue
+            info = acc.get_account_info()
+            if info["status"] == "frozen":
+                raise AccountFrozenError(
+                    f"Счёт {role} {info['account_id']} заморожен: операции запрещены")
+            if info["status"] == "closed":
+                raise AccountClosedError(
+                    f"Счёт {role} {info['account_id']} закрыт: операции запрещены")
+
+        # --- риск-анализ ---
+        recipient_key = None
+        if kind in ("internal_transfer", "external_transfer"):
+            recipient_key = f"acc:{recipient_id}" if recipient_id else f"ext:{external_recipient}"
+        amount_rub = convert(amount, currency, "RUB")
+        assessment = self._risk.evaluate(actor, amount_rub, self._clock(), recipient_key)
+        if assessment.blocked:
+            self._flag_suspicious(actor, f"Заблокирована операция {kind}: {assessment.reasons()}")
+            self._audit.log(Severity.CRITICAL, "risk_blocked",
+                            f"Операция {kind} на {amount} {currency} заблокирована "
+                            f"(риск {assessment.score}): {assessment.reasons()}",
+                            client_id=actor, error_type="RiskBlockedError", score=assessment.score)
+            raise RiskBlockedError(
+                f"Операция заблокирована: высокий риск ({assessment.score} баллов): "
+                f"{assessment.reasons()}")
+        if assessment.level.value == "medium":
+            self._audit.log(Severity.WARNING, "risk_warning",
+                            f"Операция {kind} на {amount} {currency}, средний риск "
+                            f"({assessment.score}): {assessment.reasons()}",
+                            client_id=actor, score=assessment.score)
+
+        # --- движение денег с откатом ---
+        snapshot = [(a, a._balance) for a in (sender, recipient) if a is not None]
+        try:
+            if sender is not None:
+                sender.withdraw(debit)
+            if recipient is not None:
+                recipient.deposit(credit)
+        except Exception:
+            for acc, balance in snapshot:
+                acc._balance = balance
+            raise
+
+        if recipient_key is not None:
+            self._risk.confirm(actor, recipient_key)  # после успешного перевода получатель известен
+        self._audit.log(Severity.INFO, "settled", f"Проведена операция {kind}: {amount} {currency}",
+                        client_id=actor, kind=kind, fee=fee)
+        return assessment
 
     # ---------- счета: чтение и поиск ----------
 

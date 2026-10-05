@@ -1,5 +1,6 @@
 from src.bank import Bank
 from src.bank_account import is_valid_non_negative
+from src.audit import Severity
 from src.currency import convert
 from src.exceptions import (
     AccountClosedError,
@@ -8,6 +9,7 @@ from src.exceptions import (
     InsufficientFundsError,
     InvalidOperationError,
     NightOperationError,
+    RiskBlockedError,
     TransactionRuleError,
 )
 from src.transaction import Transaction, TransactionType
@@ -17,13 +19,15 @@ from src.transaction_queue import TransactionQueue
 class TransactionProcessor:
     """Выполняет транзакции из очереди: комиссии, конвертация, повторы, журнал ошибок.
 
-    Деньги двигаются только через методы Bank, поэтому ночной запрет не обходится.
+    Деньги двигаются только через Bank.settle: там ночной запрет, риск-анализ,
+    аудит и откат при ошибке.
     """
 
     EXTERNAL_FEE_RATE = 0.01  # 1% за внешний перевод
     PERMANENT_ERRORS = (
         AccountFrozenError, AccountClosedError, InsufficientFundsError,
         InvalidOperationError, AccountNotFoundError, TransactionRuleError,
+        RiskBlockedError,
     )
 
     def __init__(self, bank: Bank, queue: TransactionQueue,
@@ -65,29 +69,59 @@ class TransactionProcessor:
             "message": f"{error} {note}".strip(),
         })
 
+    @staticmethod
+    def _kind(tx: Transaction) -> str:
+        """Тип транзакции строкой: 'deposit', 'internal_transfer', ..."""
+        return getattr(tx.type, "name", str(tx.type)).lower()
+
+    def _client_of(self, tx: Transaction):
+        """Клиент, от имени которого идёт операция (для аудита и риска)"""
+        return self._bank.owner_of(tx.sender_account_id) or self._bank.owner_of(tx.recipient)
+
     def _process(self, tx: Transaction):
         now = self._bank.now()
+        audit = self._bank.audit
+        client = self._client_of(tx)
         tx.register_attempt()
         try:
             if self._bank.is_night_now():
+                # фиксируем попытку как ночной риск, затем откладываем транзакцию
+                self._bank.risk_analyzer.record_night_attempt(client, now, self._kind(tx))
                 raise NightOperationError("Ночное время: операции временно недоступны")
             self._apply(tx)
         except NightOperationError as e:
             self._log(tx, e)
             if tx.attempts >= self._max_attempts:
-                tx.mark_failed(f"Превышено число попыток ({tx.attempts}): {e}", now)
+                message = f"Превышено число попыток ({tx.attempts}): {e}"
+                tx.mark_failed(message, now)
+                audit.log(Severity.ERROR, "tx_failed", f"{tx.id}: {message}",
+                          client_id=client, tx_id=tx.id, error_type=type(e).__name__)
             else:
                 tx.reschedule(self._bank.next_operating_time())
                 self._queue.requeue(tx)
+                audit.log(Severity.WARNING, "tx_rescheduled",
+                          f"{tx.id}: ночь, повтор позже", client_id=client, tx_id=tx.id)
+        except RiskBlockedError as e:
+            # CRITICAL-запись "risk_blocked" уже сделал банк; здесь только итог по транзакции
+            self._log(tx, e)
+            tx.mark_failed(str(e), now)
+            audit.log(Severity.WARNING, "tx_rejected", f"{tx.id}: {e}",
+                      client_id=client, tx_id=tx.id)
         except self.PERMANENT_ERRORS as e:
             self._log(tx, e)
             tx.mark_failed(str(e), now)
+            audit.log(Severity.ERROR, "tx_failed", f"{tx.id}: {e}",
+                      client_id=client, tx_id=tx.id, error_type=type(e).__name__)
         except Exception as e:
             self._log(tx, e, "(непредвиденная ошибка)")
             tx.mark_failed(f"Непредвиденная ошибка: {e}", now)
+            audit.log(Severity.CRITICAL, "tx_failed", f"{tx.id}: непредвиденная ошибка: {e}",
+                      client_id=client, tx_id=tx.id, error_type=type(e).__name__)
             raise
         else:
             tx.mark_completed(now)
+            audit.log(Severity.INFO, "tx_completed", f"{tx.id}: выполнена",
+                      client_id=client, tx_id=tx.id)
 
     # ---------- логика выполнения ----------
 
@@ -105,7 +139,6 @@ class TransactionProcessor:
         return info
 
     def _apply(self, tx: Transaction):
-        bank = self._bank
         fee = self._calc_fee(tx)
 
         sender = None
@@ -116,7 +149,7 @@ class TransactionProcessor:
             recipient = self._active_info(tx.recipient, "получателя")
         tx.set_fee(fee)
 
-        balance_before = balance_after = None
+        debit = credit = None
         if sender is not None:
             if sender["type"] != "premium":
                 if sender["balance"] < 0:
@@ -127,27 +160,15 @@ class TransactionProcessor:
                     f"Операция уведёт баланс в минус ({sender['balance']} - {debit}); "
                     f"овердрафт доступен только на премиум-счёте"
                 )
-            balance_before = sender["balance"]
-            bank.withdraw(tx.sender_account_id, debit)
-            balance_after = bank.get_account_info(tx.sender_account_id)["balance"]
-
         if recipient is not None:
             credit = convert(tx.amount, tx.currency, recipient["currency"])
-            try:
-                bank.deposit(tx.recipient, credit)
-            except (NightOperationError,) + self.PERMANENT_ERRORS as original:
-                self._rollback(tx, balance_before, balance_after, original)
-                raise
 
-    def _rollback(self, tx, balance_before, balance_after, original):
-        """Если списали, а зачислить не вышло, возвращаем отправителю всё списанное"""
-        if balance_before is None:
-            return
-        refund = round(balance_before - balance_after, 2)
-        try:
-            self._bank.deposit(tx.sender_account_id, refund)
-        except (NightOperationError,) + self.PERMANENT_ERRORS as rollback_error:
-            self._log(tx, rollback_error, "(откат не удался!)")
-            raise TransactionRuleError(
-                f"Зачисление не удалось ({original}), а возврат {refund} отправителю тоже: {rollback_error}"
-            ) from rollback_error
+        # Деньги двигает банк: ночь -> риск (high блокируется) -> списание/зачисление
+        # с автоматическим откатом -> аудит.
+        self._bank.settle(
+            self._kind(tx), tx.amount, tx.currency,
+            sender_id=tx.sender_account_id, debit=debit,
+            recipient_id=tx.recipient if recipient is not None else None, credit=credit,
+            external_recipient=tx.recipient if tx.type == TransactionType.EXTERNAL_TRANSFER else None,
+            fee=fee,
+        )

@@ -50,4 +50,7 @@ class TransactionRuleError(Exception):
     """Нарушено правило обработки транзакции"""
     pass
 
+class RiskBlockedError(Exception):
+    """Операция заблокирована системой рисков"""
+
 
