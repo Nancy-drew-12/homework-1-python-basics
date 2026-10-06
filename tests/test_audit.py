@@ -46,8 +46,14 @@ def main():
     a1 = bank.open_account("c-anna", "bank", "RUB")
     a2 = bank.open_account("c-anna", "bank", "RUB")
     b1 = bank.open_account("c-boris", "bank", "RUB")
-    bank.deposit(a1, 3_000_000)
+    # крупное пополнение банк заблокировал бы как высокий риск, поэтому вносим частями и сдвигаем время
+    start = clock.now
+    clock.now = start - timedelta(hours=1)
+    for _ in range(8):                      # 8 x 199 999 = ~1,6 млн: хватит на все сценарии
+        bank.deposit(a1, 199_999)
+        clock.now += timedelta(minutes=2)
     bank.deposit(b1, 100_000)
+    clock.now = start
 
     def run(tx_id, *args, **kwargs):
         """Создаёт транзакцию, кладёт в очередь и сразу выполняет"""
@@ -142,7 +148,8 @@ def main():
     stats = reports.error_statistics()
     print("Статистика ошибок:", stats)
     assert stats["by_error_type"]["RiskBlockedError"] == 2
-    assert reports.client_risk_profile("c-boris")["operations"] == 0
+    boris = reports.client_risk_profile("c-boris")
+    assert boris["operations"] == 1 and boris["overall_level"] == "low", "у Бориса только стартовое пополнение"
 
     section("8. Прямой вызов settle тоже блокируется")
     try:
@@ -158,6 +165,30 @@ def main():
     assert RiskAnalyzer.level_for(59) == RiskLevel.MEDIUM
     assert RiskAnalyzer.level_for(60) == RiskLevel.HIGH
     print("Границы low/medium/high верны")
+
+    section("10. Публичные deposit, withdraw и invest тоже проходят риск и аудит")
+    clock.now = datetime(2026, 10, 7, 12, 0)
+    c_roman = Client("Роман Белов", date(1991, 4, 3), "+79005550000", "roman@mail.ru", "secret123", client_id="c-roman")
+    bank.add_client(c_roman)
+    r1 = bank.open_account("c-roman", "bank", "RUB")
+    r_inv = bank.open_account("c-roman", "investment", "RUB")
+    records_before = len(bank.risk_analyzer.records())
+    for label, call in (("deposit 2 000 000", lambda: bank.deposit(r1, 2_000_000)),
+                        ("withdraw 1 500 000", lambda: bank.withdraw(r1, 1_500_000)),
+                        ("invest 1 200 000", lambda: bank.invest(r_inv, "stocks", 1_200_000))):
+        try:
+            call()
+            raise AssertionError(f"{label}: операция прошла в обход риск-анализа")
+        except RiskBlockedError as e:
+            print(f"{label}: заблокировано ({e})")
+    assert bank.get_account_info(r1)["balance"] == 0, "деньги не должны появиться на счёте"
+    assert len(bank.risk_analyzer.records()) == records_before + 3, "каждая попытка попала в риск-оценки"
+    blocked = [e for e in bank.audit.filter(client_id="c-roman") if e["event"] == "risk_blocked"]
+    assert len(blocked) == 3, "в аудите три записи risk_blocked"
+
+    bank.deposit(r1, 50_000)                  # обычная операция проходит и пишется в аудит
+    assert bank.audit.filter(client_id="c-roman")[-1]["event"] == "settled"
+    print("Обычное пополнение 50 000 проходит, запись в аудите есть")
 
     print("\nВсе проверки пройдены")
 

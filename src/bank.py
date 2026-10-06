@@ -261,27 +261,62 @@ class Bank:
     def unfreeze_account(self, account_id: str):
         self._account_for_operation(account_id, "unfreeze_account").unfreeze()
 
+    # ---------- общие внутренние методы: риск и аудит ----------
+    # Их используют ВСЕ денежные операции (deposit, withdraw, invest, settle),
+    # поэтому обойти проверку риска или аудит через публичный интерфейс банка нельзя.
+
+    def _assess_risk(self, actor, kind: str, amount: float, currency: str, recipient_key=None):
+        """Оценивает риск операции. Высокий риск блокируется (RiskBlockedError), средний пишется в аудит"""
+        amount_rub = convert(amount, currency, "RUB")
+        assessment = self._risk.evaluate(actor, amount_rub, self._clock(), recipient_key)
+        if assessment.blocked:
+            self._flag_suspicious(actor, f"Заблокирована операция {kind}: {assessment.reasons()}")
+            self._audit.log(Severity.CRITICAL, "risk_blocked",
+                            f"Операция {kind} на {amount} {currency} заблокирована (риск {assessment.score}): "
+                            f"{assessment.reasons()}",
+                            client_id=actor, error_type="RiskBlockedError", score=assessment.score)
+            raise RiskBlockedError(
+                f"Операция заблокирована: высокий риск ({assessment.score} баллов): {assessment.reasons()}")
+        if assessment.level.value == "medium":
+            self._audit.log(Severity.WARNING, "risk_warning",
+                            f"Операция {kind} на {amount} {currency}, средний риск ({assessment.score}): "
+                            f"{assessment.reasons()}", client_id=actor, score=assessment.score)
+        return assessment
+
+    def _audit_settled(self, actor, kind: str, amount: float, currency: str, **details):
+        """Запись в аудит об успешно проведённой операции"""
+        self._audit.log(Severity.INFO, "settled", f"Проведена операция {kind}: {amount} {currency}",
+                        client_id=actor, kind=kind, **details)
+
+    def _run_secured(self, account_id: str, account, kind: str, amount: float, operation):
+        """Операция над одним счётом: риск -> действие -> журнал движения денег -> аудит"""
+        actor = self._account_owner.get(account_id)
+        currency = account.get_account_info()["currency"]
+        self._assess_risk(actor, kind, amount, currency)
+        before = account.total_value()
+        result = operation()
+        self._log_change(account_id, kind, before)
+        self._audit_settled(actor, kind, amount, currency)
+        return result
+
     # ---------- счета: денежные операции (только через банк) ----------
 
     def deposit(self, account_id: str, amount: float):
         account = self._account_for_operation(account_id, "deposit")
-        before = account.total_value()
-        result = account.deposit(amount)
-        self._log_change(account_id, "deposit", before)
-        return result
+        return self._run_secured(account_id, account, "deposit", amount,
+                                 lambda: account.deposit(amount))
 
     def withdraw(self, account_id: str, amount: float):
         account = self._account_for_operation(account_id, "withdraw")
-        before = account.total_value()
-        result = account.withdraw(amount)
-        self._log_change(account_id, "withdraw", before)
-        return result
+        return self._run_secured(account_id, account, "withdraw", amount,
+                                 lambda: account.withdraw(amount))
 
     def invest(self, account_id: str, asset_type: str, amount: float):
         account = self._account_for_operation(account_id, "invest")
         if not isinstance(account, InvestmentAccount):
             raise InvalidOperationError("Инвестировать можно только с инвестиционного счёта")
-        return account.invest(asset_type, amount)
+        return self._run_secured(account_id, account, "invest", amount,
+                                 lambda: account.invest(asset_type, amount))
 
     def apply_monthly_interest(self, account_id: str):
         account = self._account_for_operation(account_id, "apply_monthly_interest")
@@ -325,20 +360,7 @@ class Bank:
         recipient_key = None
         if kind in ("internal_transfer", "external_transfer"):
             recipient_key = f"acc:{recipient_id}" if recipient_id else f"ext:{external_recipient}"
-        amount_rub = convert(amount, currency, "RUB")
-        assessment = self._risk.evaluate(actor, amount_rub, self._clock(), recipient_key)
-        if assessment.blocked:
-            self._flag_suspicious(actor, f"Заблокирована операция {kind}: {assessment.reasons()}")
-            self._audit.log(Severity.CRITICAL, "risk_blocked",
-                            f"Операция {kind} на {amount} {currency} заблокирована (риск {assessment.score}): "
-                            f"{assessment.reasons()}",
-                            client_id=actor, error_type="RiskBlockedError", score=assessment.score)
-            raise RiskBlockedError(
-                f"Операция заблокирована: высокий риск ({assessment.score} баллов): {assessment.reasons()}")
-        if assessment.level.value == "medium":
-            self._audit.log(Severity.WARNING, "risk_warning",
-                            f"Операция {kind} на {amount} {currency}, средний риск ({assessment.score}): "
-                            f"{assessment.reasons()}", client_id=actor, score=assessment.score)
+        assessment = self._assess_risk(actor, kind, amount, currency, recipient_key)
 
         # --- движение денег с откатом ---
         snapshot = [(a, a._balance) for a in (sender, recipient) if a is not None]
@@ -360,8 +382,7 @@ class Bank:
             self._log_change(recipient_id, f"{kind}_in", recipient_before)
         if recipient_key is not None:
             self._risk.confirm(actor, recipient_key)  # после успешного перевода получатель известен
-        self._audit.log(Severity.INFO, "settled", f"Проведена операция {kind}: {amount} {currency}",
-                        client_id=actor, kind=kind, fee=fee)
+        self._audit_settled(actor, kind, amount, currency, fee=fee)
         return assessment
 
     # ---------- счета: чтение и поиск ----------

@@ -13,6 +13,7 @@ from src.bank import Bank
 from src.client import Client
 from src.currency import convert
 from src.exceptions import AuthenticationError, ClientBlockedError, InvalidOperationError
+from src.risk import RiskAnalyzer
 from src.transaction import Priority, Transaction, TransactionType as T
 from src.transaction_processor import TransactionProcessor
 from src.transaction_queue import TransactionQueue
@@ -93,19 +94,39 @@ class Demo:
     def lab(self, account):
         return self.label.get(account, account)
 
+    def stamp(self):
+        return f"{self.clock.now:%d.%m %H:%M}"
+
     # ---------- инициализация ----------
+
+    def fund(self, account_id, amount):
+        """Стартовое пополнение счёта через банк.
+
+        Банк проверяет риск у любого пополнения, а сумма от 200 000 RUB считается крупной.
+        Поэтому большие суммы вносим частями ниже этого порога и между частями двигаем часы:
+        так пополнения не выглядят «частыми операциями» (больше 8 за 10 минут).
+        """
+        currency = self.bank.get_account_info(account_id)["currency"]
+        portion = convert(RiskAnalyzer.LARGE_AMOUNT - 1, "RUB", currency)
+        left = amount
+        while left > 0:
+            part = min(left, portion)
+            self.bank.deposit(account_id, part)
+            left = round(left - part, 2)
+            self.clock.advance(minutes=2)
 
     def open(self, key, client_id, account_type, currency, balance=0, **options):
         """Открывает счёт и (если нужно) кладёт на него стартовую сумму через банк"""
         account_id = self.bank.open_account(client_id, account_type, currency, **options)
         if balance:
-            self.bank.deposit(account_id, balance)
+            self.fund(account_id, balance)
         self.acc[key] = account_id
         self.label[account_id] = key
         return account_id
 
     def init_bank(self):
         self.title("1. Инициализация: банк, клиенты, счета")
+        self.clock.set(datetime(2026, 10, 5, 9, 0))   # стартовые пополнения идут до 10:00, с шагом по времени
         for index, (client_id, name, born) in enumerate(CLIENTS, start=1):
             client = Client(name, born, f"+7900000{index:04d}", f"{client_id[2:]}@mail.ru",
                             "secret123", client_id=client_id)
@@ -132,6 +153,7 @@ class Demo:
 
         self.bank.invest(self.acc["gleb-inv"], "stocks", 50_000)
         self.bank.freeze_account(self.acc["egor-frozen"])
+        self.clock.set(datetime(2026, 10, 5, 10, 0))   # дальше симуляция идёт как раньше, с 10:00
         self.say(f"Клиентов: {len(CLIENTS)}, счетов: {len(self.acc)} "
                  f"(счёт egor-frozen заморожен, у gleb-inv часть денег в акциях)")
 
@@ -242,8 +264,8 @@ class Demo:
 
         c.advance(minutes=15)
         self.title(f"7. Отложенные операции и отмена ({c.now:%H:%M})")
-        self.enqueue(T.INTERNAL_TRANSFER, 4_000, "RUB", "anna-main", "gleb-main",
-                     delay=timedelta(hours=2))
+        delayed = self.enqueue(T.INTERNAL_TRANSFER, 4_000, "RUB", "anna-main", "gleb-main",
+                               delay=timedelta(hours=2))
         cancelled = self.enqueue(T.INTERNAL_TRANSFER, 9_000, "RUB", "anna-main", "gleb-main",
                                  delay=timedelta(hours=2))
         self.queue.cancel(cancelled.id, c.now)
@@ -316,7 +338,7 @@ class Demo:
         profile = reports.client_risk_profile(client_id)
         self.say(f"  Риск-профиль: общий уровень {profile['overall_level']}, "
                  f"операций {profile['operations']}, по уровням {profile['by_level']}")
-        blocked = self.bank.audit.filter(client_id=client_id, event="risk_blocked")
+        blocked = [e for e in self.bank.audit.filter(client_id=client_id, event="risk_blocked")]
         self.say(f"  Заблокировано банком: {len(blocked)}")
 
     # ---------- отчёты ----------
